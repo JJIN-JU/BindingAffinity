@@ -696,9 +696,9 @@ attn_ckpt = "attnbind_cls_best.pt"          # AttnBind 분류
 seed_model, y_mean, y_std = load_wd_model(wd_ckpt, proj_dim=64, rank=10)
 attn = load_attn_model(attn_ckpt, seed_ckpt_path=wd_ckpt, proj_dim=64, rank=10, tau=1.0)
 
-# ---- 4) 인퍼런스: 기존 데이터 맵 그대로 사용 ----
-# ==== 인퍼런스: 37D 캐비티 (cavity_aug_map) 사용 ====
-pid = "4ty7"  # 보고 싶은 샘플로 바꿔도 OK
+
+## Inference using existing feature maps
+pid = "4ty7"  # Change to any sample you want to inspect
 print("[PID]", pid)
 
 # 11D ligand, 37D cavity
@@ -710,25 +710,25 @@ L_b   = L_raw.unsqueeze(0).to(device)     # [1,11]
 C_b   = C_raw.unsqueeze(0).to(device)     # [1,T,37]
 len_b = torch.tensor([T], dtype=torch.long, device=device)
 
-# 방어적 체크
+# Defensive checks for dimensional consistency
 assert C_b.ndim == 3 and C_b.size(-1) == 37, f"C_b shape={C_b.shape}"
 assert getattr(attn, "mu_C").numel() == 37, "attn.mu_C dim mismatch"
 assert getattr(seed_model, "mu_C").numel() == 37, "wd.mu_C dim mismatch"
 
-# z-score 분포 찍어보기 (디버그)
+# Inspect z-score distribution (debugging purpose)
 with torch.no_grad():
     Lz = (L_b - attn.mu_L) / attn.sigma_L
     Cz = (C_b - attn.mu_C) / attn.sigma_C
 print("Lz mean/std:", float(Lz.mean()), float(Lz.std()))
 print("Cz mean/std:", float(Cz.mean()), float(Cz.std()))
 
-# --- WD 회귀 예측 ---
+# WD affinity regression prediction
 seed_model.eval()
 with torch.no_grad():
     pred_aff = seed_model(L_b, C_b, len_b)
 print(f"[WD predicted affinity] {float(pred_aff):.4f}")
 
-# --- AttnBind 분류 예측 ---
+# AttnBind classification prediction
 attn.eval()
 with torch.no_grad():
     logit, alpha, alpha_prior = attn(L_b, C_b, len_b, return_alpha=True)
@@ -736,7 +736,7 @@ with torch.no_grad():
 print(f"[Attn predicted binding prob] {prob:.4f}")
 print("alpha sum:", float(alpha[0,:T].sum()), "max:", float(alpha[0,:T].max()), "min:", float(alpha[0,:T].min()))
 
-# --- Top-k 잔기 (메타 사용) ---
+# AttnBind classification prediction
 topk = min(5, T)
 idxs = alpha[0,:T].detach().cpu().numpy().argsort()[-topk:][::-1]
 for i in idxs:

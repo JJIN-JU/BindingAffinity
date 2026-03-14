@@ -1,4 +1,4 @@
-        
+from model import EnhancedAffinity, AttnBindV2        
 
 
 @torch.no_grad()

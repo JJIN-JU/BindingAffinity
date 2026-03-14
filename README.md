@@ -52,7 +52,7 @@ Additional outputs include:
 - residue attention weights
 - interaction contribution heatmaps
 
-### Model Workflow
+### 3. Model Workflow
 Ligand structure (SDF / DrugBank)
 │
 Ligand feature extraction (RDKit)
@@ -71,6 +71,6 @@ DrugBank screening & interaction analysis
 ![Workflow](workflow.png)
 
 
-### Application
+### 4. Application
 
 The trained models were used for **drug repurposing screening**, evaluating potential binding interactions between DrugBank compounds and target protein pockets.

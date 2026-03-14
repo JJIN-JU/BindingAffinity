@@ -1,18 +1,76 @@
-### Ligand–Pocket Binding Affinity Model
+## Model Architecture
 
-Development of a deep learning model to predict ligand–protein binding affinity using structural information.
+This project implements a structure-based deep learning pipeline for ligand–protein binding prediction.
 
-The model was designed to support **drug repurposing studies** by estimating the binding potential of existing drug molecules against target protein pockets.
+The system consists of two related models:
 
-Key features:
+### 1. Bilinear Affinity Model
 
-- Ligand feature extraction and embedding generation
-- Protein pocket residue feature extraction from PDB structures
-- Residue-level pocket embeddings
-- Attention-based interaction modeling between ligand and pocket
-- Binding affinity regression trained on the **PDBbind refined dataset**
-- Drug candidate screening using **DrugBank compounds**
+The primary model learns interaction patterns between ligand features and protein pocket residues.
 
-The model learns interaction patterns between ligand features and protein pocket residues to estimate binding affinity.
+Input representation:
+
+- **Ligand features (11D)**  
+  Physicochemical descriptors computed from molecular structures (RDKit).
+
+- **Protein pocket features (37D per residue)**  
+  - 20D amino-acid one-hot encoding  
+  - 13D physicochemical residue properties  
+  - 4D geometric features (ligand–residue relative position and distance)
+
+Model components:
+
+- Ligand feature encoder
+- Residue feature encoder
+- Low-rank bilinear interaction layer
+- Attention-based residue pooling
+- Affinity regression head
+
+Training dataset:
+
+- **PDBbind refined set**
+
+Evaluation:
+
+- **CASF-2016 benchmark set**
+
+This model learns interaction weights that capture ligand–pocket binding patterns.
+
+
+### 2. AttnBind Classification Model
+
+A second model was built on top of the trained bilinear model to estimate binding probability.
+
+The AttnBind model:
+
+- Initializes its parameters from the trained bilinear affinity model
+- Applies attention-based refinement over pocket residues
+- Predicts binding probability
+
+Additional outputs include:
+
+- residue attention weights
+- interaction contribution heatmaps
+
+### Model Workflow
+Ligand structure (SDF / DrugBank)
+│
+Ligand feature extraction (RDKit)
+│
+Protein pocket feature extraction (PDB)
+│
+Bilinear Affinity Model
+(training on PDBbind)
+│
+CASF-2016 evaluation
+│
+AttnBind classification model
+│
+DrugBank screening & interaction analysis
 
 ![Workflow](workflow.png)
+
+
+### Application
+
+The trained models were used for **drug repurposing screening**, evaluating potential binding interactions between DrugBank compounds and target protein pockets.

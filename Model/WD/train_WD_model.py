@@ -460,7 +460,7 @@ for pid in cavity_meta_map.keys():  # metas are retrieved from cavity_meta_map
 
 # feature augmentation
 def build_cavity_aug_map(cavity_raw_map, C_xyz_map, L_center_map, eps=1e-6):
-     """
+    """
     Construct augmented cavity features.
 
     For each pocket residue, geometric features relative to the ligand
@@ -690,8 +690,8 @@ def load_attn_model(ckpt_path, seed_ckpt_path=None, proj_dim=64, rank=10, tau=1.
     return model
 
 # Load
-wd_ckpt   = "bilinear_mise2_best.pt"        # WD 회귀
-attn_ckpt = "attnbind_cls_best.pt"          # AttnBind 분류
+wd_ckpt   = "bilinear_mise2_best.pt"        # WD affinity regression model
+attn_ckpt = "attnbind_cls_best.pt"          # AttnBind classification model
 
 seed_model, y_mean, y_std = load_wd_model(wd_ckpt, proj_dim=64, rank=10)
 attn = load_attn_model(attn_ckpt, seed_ckpt_path=wd_ckpt, proj_dim=64, rank=10, tau=1.0)
@@ -736,7 +736,7 @@ with torch.no_grad():
 print(f"[Attn predicted binding prob] {prob:.4f}")
 print("alpha sum:", float(alpha[0,:T].sum()), "max:", float(alpha[0,:T].max()), "min:", float(alpha[0,:T].min()))
 
-# AttnBind classification prediction
+# Top-k residues ranked by attention weights
 topk = min(5, T)
 idxs = alpha[0,:T].detach().cpu().numpy().argsort()[-topk:][::-1]
 for i in idxs:

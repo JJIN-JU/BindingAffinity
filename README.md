@@ -15,3 +15,4 @@ Key features:
 
 The model learns interaction patterns between ligand features and protein pocket residues to estimate binding affinity.
 
+![Workflow](workflow.png)

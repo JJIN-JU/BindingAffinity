@@ -1,3 +1,31 @@
+"""
+Binding Affinity Model Training Script
+
+This script trains a ligand–protein binding affinity prediction model using
+the PDBbind refined dataset.
+
+Main steps:
+1. Ligand feature extraction from molecular structures (RDKit)
+2. Protein pocket residue feature extraction from PDB structures
+3. Construction of ligand–pocket interaction representations
+4. Training of a bilinear interaction model with attention-based residue pooling
+
+Model details:
+- Ligand input: 11 physicochemical features
+- Protein pocket input: 37-dimensional residue features
+  (amino acid encoding + physicochemical properties + geometric features)
+
+Training dataset:
+- PDBbind refined set
+
+Evaluation dataset:
+- CASF-2016 benchmark set
+
+Output:
+- Trained model checkpoint for ligand–protein binding affinity prediction
+
+"""
+
 import pandas as pd
 import numpy as np
 import csv
@@ -12,12 +40,14 @@ from torch.utils.data import DataLoader, random_split, Dataset
 from torch.nn.utils.rnn import pad_sequence
 from torch.optim import Adam, AdamW
 from torch.optim.lr_scheduler import ReduceLROnPlateau
+import torch.nn.functional as F
 
 import matplotlib.pyplot as plt
 from tqdm import tqdm
 
 from rdkit import Chem
-from rdkit.Chem import AllChem, Descriptors, rdMolDescriptors, Crippen
+from rdkit.Chem import AllChem, Crippen
+from rdkit.Chem import Descriptors, rdMolDescriptors as rdmd
 from rdkit.ML.Descriptors import MoleculeDescriptors
 
 from sklearn.cluster import KMeans
@@ -36,8 +66,8 @@ def load_casf2016_ids(path):
     with open(path, "r") as f:
         return set(line.strip().lower() for line in f if line.strip())
 
-casf_ids = load_casf2016_ids("/home/yejin/casf2016_ids.txt")  # ← 너의 경로
-print(f"CASF ID 수: {len(casf_ids)}")
+casf_ids = load_casf2016_ids("path/to/casf2016_ids.txt")
+print(f"Number of CASF ID : {len(casf_ids)}")
 
 refined_root = "Database/CASF-2016/coreset/"
 train_ids = [d for d in os.listdir(refined_root) if os.path.isdir(os.path.join(refined_root, d))]
@@ -50,29 +80,14 @@ for pid in train_ids:
     if os.path.exists(sdf) and os.path.exists(pocket):
         valid_ids.append(pid)
 
-print(f"최종 학습 가능한 샘플 수: {len(valid_ids)}")
+print(f"Number of valid training samples: {len(valid_ids)}")
 
-"""preprocessing"""
-
-from pathlib import Path
-from tqdm import tqdm
-from rdkit import Chem
-from rdkit.Chem import Descriptors, rdMolDescriptors as rdmd
-import torch
-import torch.nn as nn
-
-# -------------------------
-# 설정
-# -------------------------
+### Data preprocessing ###
 
 refined_root_p = Path("Database/CASF-2016/coreset")
+# valid_ids: e.g.) ['1abc','2def', ...]
 
-# valid_ids: 예) ['1abc','2def', ...]
-# safe_load_molecule: 아래에서 정의
-
-# -------------------------
-# 특성 정의 및 계산 함수
-# -------------------------
+# Feature definitions and computation
 FEATURE_KEYS = [
     'HBD', 'HBA', 'RotBonds', 'AromRings',
     'Heteroatoms', 'TPSA', 'Csp3', 'FormalCharge',
@@ -80,13 +95,13 @@ FEATURE_KEYS = [
 ]
 
 def compute_features(mol):
-    # mol 은 반드시 Sanitize 완료 상태라고 가정
+    # Assume the molecule has already been sanitized
     features = {
         'HBD': Descriptors.NumHDonors(mol),
         'HBA': Descriptors.NumHAcceptors(mol),
         'RotBonds': Descriptors.NumRotatableBonds(mol),
         'AromRings': Descriptors.NumAromaticRings(mol),
-        'Heteroatoms': rdmd.CalcNumHeteroatoms(mol),  # <-- 수정포인트
+        'Heteroatoms': rdmd.CalcNumHeteroatoms(mol), 
         'TPSA': Descriptors.TPSA(mol),
         'Csp3': Descriptors.FractionCSP3(mol),
         'FormalCharge': sum(a.GetFormalCharge() for a in mol.GetAtoms()),
@@ -96,21 +111,19 @@ def compute_features(mol):
     features['DonorAcceptorRatio'] = features['HBD'] / (features['HBA'] + 1e-5)
     return torch.tensor([features[k] for k in FEATURE_KEYS], dtype=torch.float32)
 
-# -------------------------
-# 로딩 유틸
-# -------------------------
+# Assume the molecule has already been sanitized
 def safe_load_molecule(sdf_path: Path, mol2_path: Path):
-    # 1) SDF 시도 (일반)
+    # 1) Attempt loading from SDF (standard case)
     if sdf_path.exists():
         try:
-            # 단일 분자 SDF인 경우가 대부분
+            # Most files contain a single molecule
             mol = Chem.MolFromMolFile(str(sdf_path), sanitize=True, removeHs=False)
             if mol is not None:
                 return mol
         except Exception as e:
-            print(f"[SDF sanitize 실패] {sdf_path.name}: {e}")
+            print(f"[SDF sanitize failed] {sdf_path.name}: {e}")
 
-        # 2) SDF 비정상 구조: sanitize=False 후 수동 Sanitize
+        # 2) If SDF has structural issues, load with sanitize=False and sanitize manually
         try:
             suppl = Chem.SDMolSupplier(str(sdf_path), sanitize=False, removeHs=False)
             mol = next((m for m in suppl if m is not None), None)
@@ -118,16 +131,16 @@ def safe_load_molecule(sdf_path: Path, mol2_path: Path):
                 Chem.SanitizeMol(mol)
                 return mol
         except Exception as e:
-            print(f"[SDF manual sanitize 실패] {sdf_path.name}: {e}")
+            print(f"[SDF manual sanitize failed] {sdf_path.name}: {e}")
 
-    # 3) MOL2 대체
+    # 3) Fallback: try loading from MOL2
     if mol2_path.exists():
         try:
             mol = Chem.MolFromMol2File(str(mol2_path), sanitize=True, removeHs=False)
             if mol is not None:
                 return mol
         except Exception as e:
-            print(f"[MOL2 sanitize 실패] {mol2_path.name}: {e}")
+            print(f"[MOL2 sanitize failed] {mol2_path.name}: {e}")
 
         try:
             mol = Chem.MolFromMol2File(str(mol2_path), sanitize=False, removeHs=False)
@@ -135,13 +148,13 @@ def safe_load_molecule(sdf_path: Path, mol2_path: Path):
                 Chem.SanitizeMol(mol)
                 return mol
         except Exception as e:
-            print(f"[MOL2 manual sanitize 실패] {mol2_path.name}: {e}")
+            print(f"[MOL2 manual sanitize failed] {mol2_path.name}: {e}")
 
     return None
 
-# -------------------------
-# 실행
-# -------------------------
+## Execution ##
+
+## 1. Ligand feature extraction
 ligand_raw_map = {}
 missing_files = 0
 load_fail = 0
@@ -155,14 +168,14 @@ for pid in tqdm(valid_ids, desc="Ligand RAW features"):
     if not sdf_path.exists() and not mol2_path.exists():
         missing_files += 1
         if missing_files <= 10:
-            print(f"[파일없음] {pid}: {sdf_path.name} / {mol2_path.name}")
+            print(f"[Missing file] {pid}: {sdf_path.name} / {mol2_path.name}")
         continue
 
     mol = safe_load_molecule(sdf_path, mol2_path)
     if mol is None:
         load_fail += 1
         if load_fail <= 10:
-            print(f"[로딩실패] {pid}")
+            print(f"[Molecule loading failed] {pid}")
         continue
 
     try:
@@ -171,28 +184,34 @@ for pid in tqdm(valid_ids, desc="Ligand RAW features"):
     except Exception as e:
         feat_fail += 1
         if feat_fail <= 10:
-            print(f"[특성계산실패] {pid}: {e}")
+            print(f"[Feature computation failed] {pid}: {e}")
 
-print(f"\n리간드 원특징 완료: {len(ligand_raw_map)} / 전체: {len(valid_ids)}")
-print(f"파일없음: {missing_files}, 로딩실패: {load_fail}, 특성계산실패: {feat_fail}")
+print(f"\nLigand raw feature extraction completed: {len(ligand_raw_map)} / All: {len(valid_ids)}")
+print(f"Missing file: {missing_files}, Loading failed: {load_fail}, Feature computation failed: {feat_fail}")
 
 failed_ligand = [pid for pid in valid_ids if pid not in ligand_raw_map]
 if failed_ligand:
-    print("❌ 실패 목록 (일부):", failed_ligand[:10])
+    print("Failed samples (partial list):", failed_ligand[:10])
 
+
+## 2. Protein cavity feature extraction
 AA_CODES = ['A', 'R', 'N', 'D', 'C', 'Q', 'E', 'G',
             'H', 'I', 'L', 'K', 'M', 'F', 'P', 'S',
             'T', 'W', 'Y', 'V']
 
-# 각 아미노산에 대한 Hydrophobicity,numHBD,numHBA, Molecular Weight, Isoelectric Point (pI),Van der Waals volume, Polarity, Flexibility, Side chain pKa, Aromatic / Aliphatic, Charge, Solvent Accessibility,
-# Hydrophobicity: 양수일수록 소수성 강함 (Kyte-Doolittle scale 기준)
-# Polarity: 극성 여부 (높음/중간/낮음)
-# Flexibility: 구조적 유연성 (Gly는 매우 높고, Pro는 rigid)
-# VdW Vol.: Van der Waals volume, 대략적인 side chain 부피
-# Side chain pKa: side chain이 이온화될 수 있는 경우에만 표시
-# Aromatic / Aliphatic: 방향족 고리 여부
-# Charge @pH7: 중성(pH7) 기준으로 양전하 / 음전하 / 중성
-# Solvent Accessibility (RSA): 상대적 용매 접근성(대략적) – 높은 값은 구조 바깥, 낮은 값은 구조 내부
+# Amino acid physicochemical properties
+# Features include:
+# Hydrophobicity (Kyte–Doolittle scale)
+# Number of hydrogen bond donors / acceptors
+# Molecular weight
+# Isoelectric point (pI)
+# Van der Waals volume
+# Polarity
+# Flexibility
+# Side-chain pKa
+# Aromatic / aliphatic indicator
+# Net charge at physiological pH
+# Relative solvent accessibility
 
 AA_PROPERTIES = {
     'A': [ 1.8, 0, 0, 89.1, 6.01, 67, 0, 1, -1, 0, 1,  0, 45],
@@ -252,18 +271,18 @@ def extract_residue_ids_from_pocket(pdb_path):
         for chain in model:
             for res in chain:
                 hetflag, resseq, icode = res.get_id()  # (' ', 42, ' ')
-                if hetflag.strip():      # HETATM(리간드/물 등) 스킵
+                if hetflag.strip():      # Skip HETATM entries (ligands, water, etc.)
                     continue
                 if res.get_resname().strip() not in three_to_one:
                     continue
                 ids.append(resseq)
-    # 순서 고정
+    # Ensure deterministic ordering
     return sorted(set(ids))
     
 parser = PDBParser(QUIET=True)
 
 cavity_raw_map = {}
-cavity_meta_map = {}   # ← 새로 추가: pid -> [(chain, resseq, icode, resname3), ...]
+cavity_meta_map = {}   # pid -> [(chain, resseq, icode, resname3), ...]
 failed_cavity = []
 
 for pid in tqdm(valid_ids, desc="Cavity RAW features"):
@@ -272,15 +291,13 @@ for pid in tqdm(valid_ids, desc="Cavity RAW features"):
         structure = parser.get_structure("pocket", str(pocket_path))
         model = structure[0]
 
-        # 기존처럼 첫 체인만 쓰고 싶으면 get_first_chain_id() 써도 OK
-        # 여기선 모든 체인을 순회 (원하면 첫 체인만 쓰도록 바꿔도 됨)
         feats, metas = [], []
 
         for chain in model:
             chain_id = chain.id
             for res in chain:
                 hetflag, resseq, icode = res.get_id()  # (' ', 42, ' ')
-                if hetflag.strip():       # HETATM(리간드/물 등) 스킵
+                if hetflag.strip():      
                     continue
                 resname3 = res.get_resname().strip()
                 if resname3 not in three_to_one:
@@ -294,31 +311,30 @@ for pid in tqdm(valid_ids, desc="Cavity RAW features"):
                 metas.append((chain_id, int(resseq), (icode or '').strip(), resname3))
 
         if not feats:
-            raise ValueError("유효한 cavity residue가 없습니다.")
+            raise ValueError("No valid cavity residues found.")
 
         cavity_raw_map[pid]  = torch.stack(feats).float()  # [T, 33]
-        cavity_meta_map[pid] = metas                       # 길이 T와 1:1 대응
+        cavity_meta_map[pid] = metas                       
 
     except Exception as e:
         failed_cavity.append((pid, str(e)))
-        print(f"❌ Cavity {pid}: {e}")
+        print(f"Cavity extraction failed for  {pid}: {e}")
 
-print(f"✅ cavity 원특징 완료: {len(cavity_raw_map)} / 실패: {len(failed_cavity)}")
-print(f"✅ cavity 메타 완료: {len(cavity_meta_map)} (예: {next(iter(cavity_meta_map.values()))[:3]})")
+print(f"Cavity feature extraction completed: {len(cavity_raw_map)} / Failed {len(failed_cavity)}")
+print(f"Cavity metadata stored: {len(cavity_meta_map)} (e.g.: {next(iter(cavity_meta_map.values()))[:3]})")
 
-from pathlib import Path
-from Bio.PDB import PDBParser
-import torch, numpy as np
-from rdkit import Chem
+
+## 3. Model input preprocessing
 
 parser = PDBParser(QUIET=True)
 
 def _meta_to_key(meta):
     """
-    cavity_meta_map 항목을 (chain, resseq, icode)로 통일.
-    지원:
-      (chain, resseq, resname)             -> (chain, resseq, '')
-      (chain, resseq, icode, resname)      -> (chain, resseq, icode)
+    Normalize cavity_meta_map entries to the format (chain, resseq, icode).
+
+    Supported formats:
+      (chain, resseq, resname)        -> (chain, resseq, '')
+      (chain, resseq, icode, resname) -> (chain, resseq, icode)
     """
     if len(meta) >= 4:
         chain, resseq, icode, _ = meta[:4]
@@ -326,20 +342,22 @@ def _meta_to_key(meta):
     elif len(meta) == 3:
         chain, resseq, _ = meta
         return (str(chain), int(resseq), '')
-    else:  # 비정형 방어
+    else:  # fallback for unexpected formats
         chain = str(meta[0]); resseq = int(meta[1])
         icode = meta[2] if len(meta) > 2 else ''
         return (chain, resseq, (icode or '').strip())
 
 def get_ca_xyz_by_meta(pdb_path, metas):
     """
-    metas: cavity_meta_map[pid] (체인/잔기/icode/이름 등 포함)
-    return: torch.float32 [T,3]
+    metas: cavity_meta_map[pid] (contains chain/residue/icode information)
+
+    Returns:
+        torch.float32 tensor of shape [T,3] containing residue coordinates
     """
     structure = parser.get_structure("prot", pdb_path)
     model = structure[0]
 
-    # (chain, resseq, icode) -> 좌표
+    # (chain, resseq, icode) -> coordinate dictionary
     ca_dict = {}
     fallback = {}
     for chain in model:
@@ -351,6 +369,7 @@ def get_ca_xyz_by_meta(pdb_path, metas):
             if "CA" in res:
                 ca_dict[key] = res["CA"].get_coord().astype(np.float32)
             else:
+                # If CA atom is missing, estimate coordinate from backbone atoms
                 coords = []
                 for an in ("N", "C", "O", "CB"):
                     if an in res:
@@ -358,16 +377,17 @@ def get_ca_xyz_by_meta(pdb_path, metas):
                 if coords:
                     fallback[key] = np.mean(np.vstack(coords), axis=0).astype(np.float32)
                 else:
+                    # Final fallback: use the first available atom coordinate
                     atoms = list(res.get_atoms())
                     if atoms:
                         fallback[key] = atoms[0].get_coord().astype(np.float32)
 
     out = []
     for meta in metas:
-        key = _meta_to_key(meta)                     # 정확키
+        key = _meta_to_key(meta)                     
         xyz = ca_dict.get(key)
         if xyz is None:
-            # icode 없는 메타일 수도 있으니 icode=''도 시도
+            # try matching without insertion code
             key_ni = (key[0], key[1], '')
             xyz = ca_dict.get(key_ni)
         if xyz is None:
@@ -380,7 +400,10 @@ def get_ca_xyz_by_meta(pdb_path, metas):
     return torch.from_numpy(arr)
 
 def ligand_centroid_from_sdf_or_mol2(lig_path):
-    """SDF/MOL2에서 리간드 좌표 중심 반환(실패 시 0벡터)."""
+    """
+    Compute ligand centroid from SDF or MOL2 coordinates.
+    Returns a zero vector if extraction fails.
+    """
     mol = None
     p = str(lig_path)
     try:
@@ -402,23 +425,23 @@ def ligand_centroid_from_sdf_or_mol2(lig_path):
     center = np.mean(np.asarray(coords, dtype=np.float32), axis=0)
     return torch.from_numpy(center)
 
-# ===== 실제 생성 =====
-C_xyz_map = {}     # pid -> [T,3]
-L_center_map = {}  # pid -> [3]
+# Coordinate generation
+C_xyz_map = {}     # pid -> residue coordinates [T,3]
+L_center_map = {}  # pid -> ligand centroid [3]
 
 refined_root_p = Path("Database/CASF-2016/coreset")
 
-for pid in cavity_meta_map.keys():  # ★ metas는 meta_map에서!
+for pid in cavity_meta_map.keys():  # metas are retrieved from cavity_meta_map
     pocket_pdb = refined_root_p / pid / f"{pid}_pocket.pdb"
     sdf_path   = refined_root_p / pid / f"{pid}_ligand.sdf"
     mol2_path  = refined_root_p / pid / f"{pid}_ligand.mol2"
     lig_path   = sdf_path if sdf_path.exists() else mol2_path
 
     try:
-        metas = cavity_meta_map[pid]                              # <-- 여기!
+        metas = cavity_meta_map[pid]                              
         C_xyz = get_ca_xyz_by_meta(str(pocket_pdb), metas)        # [T,3]
         L_ctr = ligand_centroid_from_sdf_or_mol2(lig_path)        # [3]
-        # 길이 안전장치(거의 필요 없겠지만 혹시 몰라)
+        # Safety check for length mismatch (rare but handled defensively)
         T = len(metas)
         if C_xyz.shape[0] != T:
             if C_xyz.shape[0] > T:
@@ -434,13 +457,35 @@ for pid in cavity_meta_map.keys():  # ★ metas는 meta_map에서!
         C_xyz_map[pid] = torch.zeros((T,3), dtype=torch.float32)
         L_center_map[pid] = torch.zeros(3, dtype=torch.float32)
 
-import torch
-import numpy as np
 
+# feature augmentation
 def build_cavity_aug_map(cavity_raw_map, C_xyz_map, L_center_map, eps=1e-6):
-    """
-    returns: cavity_aug_map[pid] -> [T, 33+4]
-    추가되는 4개: dx, dy, dz, r (리간드 중심 대비)
+     """
+    Construct augmented cavity features.
+
+    For each pocket residue, geometric features relative to the ligand
+    centroid are added to the physicochemical residue features.
+
+    Input
+    -----
+    cavity_raw_map : dict
+        pid -> residue feature tensor [T,33]
+
+    C_xyz_map : dict
+        pid -> residue coordinates [T,3]
+
+    L_center_map : dict
+        pid -> ligand centroid coordinates [3]
+
+    Returns
+    -------
+    cavity_aug_map : dict
+        pid -> augmented cavity features [T,37]
+
+    Added geometric features
+    ------------------------
+    dx, dy, dz : residue position relative to ligand centroid
+    r          : Euclidean distance to ligand centroid
     """
     cavity_aug_map = {}
     for pid, C_raw in cavity_raw_map.items():
@@ -452,28 +497,28 @@ def build_cavity_aug_map(cavity_raw_map, C_xyz_map, L_center_map, eps=1e-6):
         cavity_aug_map[pid] = C_aug
     return cavity_aug_map
 
-# 만들기
+# Build augmented cavity feature map
 cavity_aug_map = build_cavity_aug_map(cavity_raw_map, C_xyz_map, L_center_map)
-print("✅ cavity_aug_map 예시 shape:", next(iter(cavity_aug_map.values())).shape)  # [T,37] 기대
+print("Example cavity_aug_map shape:", next(iter(cavity_aug_map.values())).shape)  # [T,37] 기대
 
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
+
+
+### Model ###
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# ---- bilinear 클래스 (학습 때 쓰던 그대로) ----
+# Bilinear affinity model (same architecture used during training)
 class BilinearAffinityZ_MLP_LR(nn.Module):
     def __init__(self, lig_dim, cav_dim, proj_dim=64, rank=10, 
                  mu_L=None, sigma_L=None, mu_C=None, sigma_C=None):
         super().__init__()
-        # z-score용 통계(고정 버퍼)
+        # z-score normalization statistics (stored as fixed buffers)
         self.register_buffer("mu_L", mu_L.clone().float())
         self.register_buffer("sigma_L", sigma_L.clone().float().clamp_min(1e-6))
         self.register_buffer("mu_C", mu_C.clone().float())
         self.register_buffer("sigma_C", sigma_C.clone().float().clamp_min(1e-6))
 
-        # 인코더
+        # ligand and cavity encoders
         self.lig_proj = nn.Sequential(
             nn.Linear(lig_dim, proj_dim), nn.ReLU(), nn.LayerNorm(proj_dim), nn.Dropout(0.05)
         )
@@ -481,7 +526,7 @@ class BilinearAffinityZ_MLP_LR(nn.Module):
             nn.Linear(cav_dim, proj_dim), nn.ReLU(), nn.LayerNorm(proj_dim), nn.Dropout(0.05)
         )
 
-        # 저랭크 bilinear: W = U V^T
+        # low-rank bilinear interaction: W = U V^T
         self.U = nn.Parameter(torch.empty(proj_dim, rank))
         self.V = nn.Parameter(torch.empty(proj_dim, rank))
         nn.init.xavier_uniform_(self.U); nn.init.xavier_uniform_(self.V)
@@ -495,52 +540,52 @@ class BilinearAffinityZ_MLP_LR(nn.Module):
 
     def forward(self, L_raw, C_raw, lengths):
         """
-        L_raw: [B, 11]
-        C_raw: [B, T, 37]  ← 좌표 포함 최신 cavity 특징
-        lengths: [B]
+        L_raw : [B, 11]        ligand raw features
+        C_raw : [B, T, 37]     cavity features including geometric terms
+        lengths : [B]          number of valid residues per pocket
         """
+        
         B, T, D = C_raw.shape
 
-        # 1) per-feature z-score
+        # per-feature z-score
         Lz = (L_raw - self.mu_L) / self.sigma_L              # [B,11]
         Cz_per_res = (C_raw - self.mu_C) / self.sigma_C      # [B,T,37]
 
-        # 2) projection
+        # projection
         Lh = self.lig_proj(Lz)                                # [B,H]
         Ch_full = self.cav_proj(Cz_per_res.reshape(-1, D)).view(B, T, -1)  # [B,T,H]
 
-        # 3) attention score s_t (prior 없이도 OK)
+        # attention score s_t
         W = self.U @ self.V.T                                 # [H,H]
         LW = Lh @ W                                           # [B,H]
-        # 점수: bilinear term + cavity main (b) as bias
         s = (LW.unsqueeze(1) * Ch_full).sum(-1) + (self.b * Ch_full).sum(-1)  # [B,T]
 
-        # 4) valid mask
+        # valid mask
         idxs = torch.arange(T, device=C_raw.device).unsqueeze(0).expand(B, T)
         mask = idxs < lengths.unsqueeze(1)
 
-        # 5) attention weights α & weighted pooling
+        # attention weights α & weighted pooling
         alpha = torch.softmax(s.masked_fill(~mask, -1e9), dim=1)             # [B,T]
         Ch = (alpha.unsqueeze(2) * Ch_full).sum(1)                            # [B,H]
 
-        # 6) 최종 예측: bilinear + main + bias
-        # (W는 이미 위에서 계산됨)
+        # final prediction: bilinear + main + bias
         bilinear = (LW * Ch).sum(1)                                           # [B]
         main = (Lh * self.a).sum(1) + (Ch * self.b).sum(1)                    # [B]
         return bilinear + main + self.bias
 
-# ---- 어텐션 분류기 (bilinear seed에서 파라미터/통계 복제) ----
+
+# Attention-based binding classifier (initialized from bilinear seed model)
 class AttnBind(nn.Module):
     def __init__(self, bilinear_seed, tau=1.0):
         super().__init__()
         import copy
-        # 통계 복제
+        # copy normalization statistics
         self.register_buffer("mu_L", bilinear_seed.mu_L.clone())
         self.register_buffer("sigma_L", bilinear_seed.sigma_L.clone())
         self.register_buffer("mu_C", bilinear_seed.mu_C.clone())
         self.register_buffer("sigma_C", bilinear_seed.sigma_C.clone())
 
-        # proj/저랭크/주효과 복제
+        # copy projection layers and interaction parameters
         self.lig_proj = copy.deepcopy(bilinear_seed.lig_proj)
         self.cav_proj = copy.deepcopy(bilinear_seed.cav_proj)
         self.U = nn.Parameter(bilinear_seed.U.detach().clone())
@@ -549,23 +594,23 @@ class AttnBind(nn.Module):
         self.b = nn.Parameter(bilinear_seed.b.detach().clone())
         self.bias = nn.Parameter(bilinear_seed.bias.detach().clone())
 
-        # hidden dim(H) 자동 추론
+        # automatically infer hidden dimension
         H = self.U.size(0)
         self.proj_dim = H
         self.tau = tau
 
-        # 분류 head
+        # automatically infer hidden dimension
         self.head = nn.Sequential(
             nn.Linear(2*H, 128), nn.ReLU(), nn.Dropout(0.2),
             nn.Linear(128, 1)
         )
-        # prior 보정(선택)
+        # optional attention prior correction
         self.delta = nn.Sequential(
             nn.Linear(2*H, 64), nn.ReLU(), nn.Linear(64, 1)
         )
 
     def forward(self, L_raw, C_raw, lengths, return_alpha=False):
-        B, T, D = C_raw.shape  # D가 33 또는 37 어떤 것이든 지원
+        B, T, D = C_raw.shape
         # z-score (per-residue)
         Lz = (L_raw - self.mu_L) / self.sigma_L             # [B,11]
         Cz_full = (C_raw - self.mu_C) / self.sigma_C        # [B,T,D]
@@ -596,7 +641,7 @@ class AttnBind(nn.Module):
         logit = self.head(torch.cat([Lh, context], dim=-1)).squeeze(1) + self.bias # [B]
         return (logit, alpha, alpha_prior) if return_alpha else logit
 
-import torch
+############################
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 

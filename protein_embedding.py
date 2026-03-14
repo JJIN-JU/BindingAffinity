@@ -18,6 +18,8 @@ Each residue was encoded using a 35-dimensional feature vector including:
 - Solvent accessible surface area (SASA)
 - Relative spatial coordinates within the cavity
 
+*35-dimensional : 20 (AA one-hot) + 5 physicochemical properties + 10 structural features
+
 The residue features were projected into a 128-dimensional embedding space using a feed-forward neural layer.
 
 """
@@ -30,6 +32,7 @@ import torch
 import torch.nn as nn
 
 import matplotlib.pyplot as plt
+import math, numpy as np, torch
 from tqdm import tqdm
 
 from rdkit import Chem, DataStructs
@@ -64,9 +67,11 @@ for chain in structure[0]:
                 print(f"  {j+1}: {res.get_resname()} - Chain: {chain.id}, PDB residue number: {res.get_id()[1]}")
 
 
-import math, numpy as np, torch
-from Bio.PDB import PDBParser
-# 0) 표준 상수: Kyte–Doolittle, side-chain pKa, Max ASA, Arom/Aliphatic
+
+# Standard biochemical constants used for residue feature computation
+# Includes Kyte–Doolittle hydrophobicity, side-chain pKa values,
+# maximum solvent-accessible surface area (Max ASA),
+# and residue aromatic/aliphatic classifications.
 
 KYTE_DOOLITTLE = {
     'A': 1.8,'R':-4.5,'N':-3.5,'D':-3.5,'C': 2.5,'Q':-3.5,'E':-3.5,'G':-0.4,
@@ -77,13 +82,16 @@ SIDECHAIN_PKA = {'D':3.9,'E':4.3,'H':6.0,'C':8.3,'Y':10.1,'K':10.5,'R':12.5}
 AROMATIC = set(['F','Y','W','H'])
 ALIPHATIC = set(['A','V','I','L','M'])
 
-# (Tien et al./Miller 등 관용 Max ASA; 단위 Å^2)
+# Maximum solvent accessible surface area values (Å^2)
+# Commonly used reference values reported in Tien et al. and Miller et al.
 MAX_ASA = {
     'A':129,'R':274,'N':195,'D':193,'C':167,'Q':225,'E':223,'G':104,'H':224,'I':197,
     'L':201,'K':236,'M':224,'F':240,'P':159,'S':155,'T':172,'W':285,'Y':263,'V':174
 }
 
-# 원자 질량/반경(구형 근사; 중복/오버랩은 무시하는 proxy)
+# Atomic masses and van der Waals radii 
+# Used for approximate residue mass and volume estimation
+# (spherical approximation; overlap between atoms is ignored)
 ATOMIC_MASS = {"H":1.008,"C":12.011,"N":14.007,"O":15.999,"S":32.06,"P":30.974,
                "F":18.998,"Cl":35.45,"Br":79.904,"I":126.90,"Se":78.971}
 VDW_RADIUS  = {"H":1.20,"C":1.70,"N":1.55,"O":1.52,"S":1.80,"P":1.80,"F":1.47,
@@ -95,8 +103,8 @@ AA3_TO_1 = {'ALA':'A','ARG':'R','ASN':'N','ASP':'D','CYS':'C','GLN':'Q','GLU':'E
 AA_CODES = ['A','R','N','D','C','Q','E','G','H','I','L','K','M','F','P','S','T','W','Y','V']
 
 
-# 1) 화학/평형 계산: pH 7에서 side-chain 전하 근사(Henderson–Hasselbalch)
-
+# Estimate side-chain charge at physiological pH (~7)
+# using the Henderson–Hasselbalch approximation
 def charge_at_pH7(aa, pH=7.0):
     if aa not in SIDECHAIN_PKA:
         return 0.0
@@ -109,7 +117,7 @@ def charge_at_pH7(aa, pH=7.0):
         return +frac_prot
     return 0.0
 
-# 2) 구조 기반 계산 유틸
+# Structure-based helper functions for residue feature computation
 def residue_atom_array(residue, include_h=False):
     coords, elems, bvals = [], [], []
     for atom in residue.get_atoms():
@@ -152,7 +160,8 @@ def bfactor_mean(residue):
     if b is None or len(b)==0: return 0.0
     return float(np.nanmean(b))
 
-# Biopython Shrake–Rupley로 residue별 SASA 계산 (Å^2)
+# Compute residue-level solvent accessible surface area (SASA)
+# using the Shrake–Rupley algorithm implemented in Biopython
 def sasa_residue_map_biopython(structure):
     from Bio.PDB.SASA import ShrakeRupley
     sr = ShrakeRupley()                  # 기본: probe_radius=1.4Å, n_points=100
@@ -167,11 +176,10 @@ def sasa_residue_map_biopython(structure):
     return sasa_map
 
 
-# 3) 잔기 단위 피처 벡터 조립 (표준 + 구조 기반)
+# Assemble the residue-level feature vector combining physicochemical descriptors and structural features
 #    one-hot(20)
 #    + [hydrophobicity, sidechain_pKa_or0, aromatic(0/1), aliphatic(0/1), charge_pH7]
 #    + [mass, vdw_volume, polarity_frac, bfactor_mean, SASA, RSA, rel_x, rel_y, rel_z, dist]
-# residue_feature_vector에 precomputed_sasa_map을 인자로 받도록
 
 def residue_feature_vector(residue, cavity_center, pH=7.0, structure=None, precomputed_sasa=None):
     res3 = residue.get_resname().strip()
@@ -213,8 +221,8 @@ def residue_feature_vector(residue, cavity_center, pH=7.0, structure=None, preco
     return torch.tensor(feats, dtype=torch.float32)
 
 
-# Cavity matrix: 선택 잔기들의 평균 중심을 cavity_center로 사용
-
+# Build cavity feature matrix.
+# The cavity center is defined as the mean centroid of selected residues.
 def build_cavity_features(pdb_path, chain_id, residue_numbers, pH=7.0, use_sasa=True):
     parser   = PDBParser(QUIET=True)
     structure= parser.get_structure("prot", pdb_path)
@@ -255,12 +263,12 @@ def build_cavity_features(pdb_path, chain_id, residue_numbers, pH=7.0, use_sasa=
 C_raw_target, residues, ctr = build_cavity_features(
     pdb_path="/home/yejin/Downloads/9cgi.pdb",
     chain_id="A",
-    residue_numbers=[831,832,833,834], # change your target interation residue number
+    residue_numbers=[831,832,833,834], # Specify residue numbers that define the target binding pocket motif
     pH=7.0,
-    use_sasa=True  # FreeSASA 설치 후 True
+    use_sasa=True  # Set to True to compute SASA using the Shrake–Rupley algorithm
 )
 
-residue_numbers=[831,832,833,834]
+residue_numbers=[831,832,833,834] # Specify residue numbers that define the target binding pocket motif
 
 C=C_raw_target
 
@@ -270,19 +278,19 @@ from datetime import datetime
 def save_cavity_cache(pdb_id, chain_id, residue_numbers, C, residues, cavity_center,
                       out_dir="./cache_cavity", use_sasa=False, schema_version="cavity35_v1"):
     """
-    C: torch.Tensor [p, d]  (build_cavity_features로 얻은 원시 캐비티 피처)
-    residues: Bio.PDB residue 리스트 (정렬됨)
+    C: torch.Tensor [p, d]
+    residues: Bio.PDB residue list
     cavity_center: np.array(3,)
     """
     os.makedirs(out_dir, exist_ok=True)
 
-    # 파일명: <PDBID>_<CHAIN>_<minRes>-<maxRes>_<schema>.pt
+    # file name: <PDBID>_<CHAIN>_<minRes>-<maxRes>_<schema>.pt
     tag = f"{min(residue_numbers)}-{max(residue_numbers)}" if residue_numbers else "custom"
     fname = f"{pdb_id}_{chain_id}_{tag}_{schema_version}.pt"
     fpath = os.path.join(out_dir, fname)
     tmp_path = fpath + ".tmp"
 
-    # 잔기 메타데이터(로드 후 매칭 확인용)
+    # Residue metadata used to verify correct pocket matching when loading cache
     res_meta = []
     for r in residues:
         hetflag, seqnum, icode = r.get_id()
@@ -298,16 +306,15 @@ def save_cavity_cache(pdb_id, chain_id, residue_numbers, C, residues, cavity_cen
         "pdb_id": pdb_id,
         "chain_id": chain_id,
         "residue_numbers": list(map(int, residue_numbers)),
-        "schema_version": schema_version,      # 예: cavity 35D 스키마
+        "schema_version": schema_version,      
         "use_sasa": bool(use_sasa),
         "shape": tuple(C.shape),
         "saved_at": datetime.utcnow().isoformat() + "Z",
-        "cavity_center": cavity_center.astype(float),  # numpy -> 저장 가능
+        "cavity_center": cavity_center.astype(float),  
         "residues": res_meta,
         "C": C.cpu(),  # GPU 텐서일 수 있으니 CPU로 저장
     }
 
-    # 원자적 저장: tmp에 먼저 쓴 뒤 rename
     torch.save(payload, tmp_path)
     os.replace(tmp_path, fpath)
 

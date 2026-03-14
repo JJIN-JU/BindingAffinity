@@ -91,7 +91,7 @@ def compute_features_15d(mol):
     try:
         Heteroatoms = Descriptors.NumHeteroatoms(mol)
     except Exception:
-        Heteroatoms = rdmd.CalcNumHeteroatoms(mol)
+        Heteroatoms = rdMolDescriptors.CalcNumHeteroatomss(mol)
     TPSA = Descriptors.TPSA(mol)
     Csp3 = Descriptors.FractionCSP3(mol)
     FormalCharge = sum(a.GetFormalCharge() for a in mol.GetAtoms())

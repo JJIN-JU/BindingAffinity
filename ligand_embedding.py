@@ -26,21 +26,21 @@ from sklearn.preprocessing import StandardScaler
 from Bio.PDB import PDBParser
 from Bio.PDB import NeighborSearch
 
+# Path to DrugBank ligand library (SDF format)
 ligands_file = "Database/drugbank/approved_drugs.sdf"
 
-# ligands information
-
+# Load ligand library and count valid molecules
 supplier = Chem.SDMolSupplier(ligands_file)
 mol_count = sum(1 for mol in supplier if mol is not None)
 
 print(f"Total {mol_count} ligands")
 
-# rdkit descriptor list
+# Load ligand library and count valid molecules
 descriptor_names = [name for name, _ in Descriptors.descList]
 print('\n'.join(descriptor_names))
 
 
-### Embedding ###
+# Functional group patterns used for estimating acidic and basic properties
 
 ACIDIC_SMARTS = [
     Chem.MolFromSmarts('[CX3](=O)[OX1H0-,OX2H1]'),
@@ -54,6 +54,8 @@ BASIC_SMARTS = [
     Chem.MolFromSmarts('C(=N)N'),
     Chem.MolFromSmarts('N-C(=N)-N')
 ]
+
+# Descriptor keys used in the 15D feature vector
 FEATURE_KEYS = [
     'HBD','HBA','RotBonds','AromRings',
     'Heteroatoms','TPSA','Csp3','FormalCharge',
@@ -61,6 +63,7 @@ FEATURE_KEYS = [
     'AcidicEstimate','BasicEstimate','HydrophobicEstimate'
 ]
 
+# Count functional groups defined by SMARTS patterns
 def count_groups(mol, smarts_list):
     cnt = 0
     for patt in smarts_list:
@@ -68,6 +71,8 @@ def count_groups(mol, smarts_list):
         cnt += len(mol.GetSubstructMatches(patt))
     return cnt
 
+
+# Estimate hydrophilic and hydrophobic surface areas using SlogP_VSA descriptors
 def hydrophobicity_vsa(mol):
     bins = [
         Descriptors.SlogP_VSA1(mol), Descriptors.SlogP_VSA2(mol), Descriptors.SlogP_VSA3(mol),
@@ -77,6 +82,7 @@ def hydrophobicity_vsa(mol):
     ]
     return sum(bins[0:3]), sum(bins[6:10])
 
+# Compute 15 physicochemical descriptors
 def compute_features_15d(mol):
     HBD = Descriptors.NumHDonors(mol)
     HBA = Descriptors.NumHAcceptors(mol)
@@ -111,12 +117,14 @@ def compute_features_15d(mol):
     v15 = torch.tensor([feats[k] for k in FEATURE_KEYS], dtype=torch.float32)  
     return v15
 
+# Generate Morgan fingerprint (ECFP4)
 def ecfp1024(mol, radius=2, nBits=1024, useChirality=True):
     fp = AllChem.GetMorganFingerprintAsBitVect(mol, radius=radius, nBits=nBits, useChirality=useChirality)
     arr = np.zeros((nBits,), dtype=np.int8)
     DataStructs.ConvertToNumpyArray(fp, arr)
     return torch.from_numpy(arr.astype(np.float32))
 
+# Combine descriptors and fingerprint
 def compute_ligand_vec_1039(mol):
     try:
         v15 = compute_features_15d(mol)               
@@ -129,6 +137,7 @@ def compute_ligand_vec_1039(mol):
         print(f"Fail: {e}")
         return None
 
+### Process DrugBank SDF file and generate embeddings ###
 def process_drugbank_sdf_with_names(sdf_file):
     suppl = Chem.SDMolSupplier(sdf_file, sanitize=True, removeHs=False)
     vecs, names = [], []
@@ -159,6 +168,8 @@ def process_drugbank_sdf_with_names(sdf_file):
     print(f"Success: {ok} / Fail: {fail} | X.shape={X.shape}")
     return X, names
 
-
+# Generate ligand embeddings
 X_L, ligand_names = process_drugbank_sdf_with_names(ligands_file)
+
+# Save embedding matrix
 torch.save({"X_L": X_L, "names": ligand_names}, "path/to/save/model.pt")

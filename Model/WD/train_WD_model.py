@@ -499,7 +499,7 @@ def build_cavity_aug_map(cavity_raw_map, C_xyz_map, L_center_map, eps=1e-6):
 
 # Build augmented cavity feature map
 cavity_aug_map = build_cavity_aug_map(cavity_raw_map, C_xyz_map, L_center_map)
-print("Example cavity_aug_map shape:", next(iter(cavity_aug_map.values())).shape)  # [T,37] 기대
+print("Example cavity_aug_map shape:", next(iter(cavity_aug_map.values())).shape)  # [T,37]
 
 
 
@@ -676,7 +676,7 @@ def load_attn_model(ckpt_path, seed_ckpt_path=None, proj_dim=64, rank=10, tau=1.
             mu_C=seed_ck["mu_C"], sigma_C=seed_ck["sigma_C"]
         )
         seed_model.load_state_dict(seed_ck["state_dict"], strict=True)
-        model = AttnBind(seed_model, tau=tau)   # 통계/프로젝션/저랭크 가중치 시드 복제
+        model = AttnBind(seed_model, tau=tau)   # WD seed
     else:
         # Initialize AttnBind using parameters from the WD model
         model = AttnBind_from_stats(
@@ -690,7 +690,7 @@ def load_attn_model(ckpt_path, seed_ckpt_path=None, proj_dim=64, rank=10, tau=1.
     return model
 
 # Load
-wd_ckpt   = "bilinear_mise2_best.pt"        # WD affinity regression model
+wd_ckpt   = "bilinear_best.pt"        # WD affinity regression model
 attn_ckpt = "attnbind_cls_best.pt"          # AttnBind classification model
 
 seed_model, y_mean, y_std = load_wd_model(wd_ckpt, proj_dim=64, rank=10)
@@ -703,7 +703,7 @@ print("[PID]", pid)
 
 # 11D ligand, 37D cavity
 L_raw = ligand_raw_map[pid]               # [11]
-C_raw = cavity_aug_map[pid]               # [T,37]  ← 중요: 이미 만들어둔 37D 맵
+C_raw = cavity_aug_map[pid]               # [T,37]  
 T = C_raw.size(0)
 
 L_b   = L_raw.unsqueeze(0).to(device)     # [1,11]

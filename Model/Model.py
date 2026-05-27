@@ -45,7 +45,7 @@ class AffinityPredictor_before_WD(nn.Module):
         return S
 
 # --------------------------
-# 가중치 학습 모델 사용
+# using weighted model
 # --------------------------
 class EnhancedAffinity(nn.Module):
     def __init__(
@@ -58,7 +58,7 @@ class EnhancedAffinity(nn.Module):
         mu_C=None, sigma_C=None
     ):
         super().__init__()
-        # --- z-score 통계 버퍼 (15D만) ---
+        # --- z-score ---
         self.register_buffer("mu_L15", mu_L15.clone().float())
         self.register_buffer("sigma_L15", sigma_L15.clone().float().clamp_min(1e-6))
         self.register_buffer("mu_C", mu_C.clone().float())
@@ -73,7 +73,6 @@ class EnhancedAffinity(nn.Module):
             nn.Linear(ecfp_dim, hid),
             nn.ReLU(), nn.LayerNorm(hid), nn.Dropout(dropout),
         )
-        # 결합 후 얇게 정리
         self.lig_fuse = nn.Sequential(
             nn.Linear(2*hid, hid),
             nn.ReLU(), nn.LayerNorm(hid), nn.Dropout(dropout),
@@ -90,7 +89,7 @@ class EnhancedAffinity(nn.Module):
             nn.Linear(4*hid, hid), nn.LayerNorm(hid),
         )
 
-        # --- Bilinear (저랭크) for WD term ---
+        # --- Bilinear for WD term ---
         rank = 32
         self.U = nn.Parameter(torch.empty(hid, rank))
         self.V = nn.Parameter(torch.empty(hid, rank))
@@ -121,12 +120,12 @@ class EnhancedAffinity(nn.Module):
         B, T, D = C_raw.shape
 
         # split
-        L15 = L_raw[:, :15]      # 연속 특성
-        Lfp = L_raw[:, 15:]      # ECFP (0/1 또는 sparse float)
+        L15 = L_raw[:, :15]      
+        Lfp = L_raw[:, 15:]      # ECFP (0/1 or sparse float)
 
         # 15D만 z-score
         L15z = (L15 - self.mu_L15) / self.sigma_L15
-        # 캐비티는 기존대로 전 특징 정규화
+        # cavity (all feature)
         Cz   = (C_raw - self.mu_C) / self.sigma_C
 
         # ligand towers
@@ -134,7 +133,7 @@ class EnhancedAffinity(nn.Module):
         Lfph = self.ligfp(Lfp)
         Lh   = self.lig_fuse(torch.cat([L15h, Lfph], dim=1))  # [B,hid]
 
-        # cavity contextualization (기존과 동일)
+        # cavity contextualization
         Ch0 = self.cav_proj(Cz.reshape(-1, D)).view(B, T, -1)
 
         idxs = torch.arange(T, device=C_raw.device).unsqueeze(0).expand(B, T)
@@ -152,7 +151,7 @@ class EnhancedAffinity(nn.Module):
             B, T = key_padding_mask.shape
             keep = torch.rand(B, T, device=key_padding_mask.device) > self.res_drop_p
             keep = keep & (~key_padding_mask)
-            # 최소 1개는 유지
+            # at least 1
             first_valid = torch.zeros_like(keep); first_valid[:,0] = True
             keep = keep | first_valid
             key_padding_mask = key_padding_mask | (~keep)
@@ -173,14 +172,14 @@ class EnhancedAffinity(nn.Module):
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print("device:", device)
 
-# === 0) 체크포인트 로드 ===
+# === Load Checkpoint ===
 ck = torch.load("enhanced_affinity_cosine_warmup_best2.pt", map_location="cpu")
 
 mu_L15, sigma_L15 = ck["mu_L15"], ck["sigma_L15"]
 mu_C,   sigma_C   = ck["mu_C"],   ck["sigma_C"]
 y_mean, y_std     = ck["y_mean"], ck["y_std"]
 
-# === 1) 모델 생성/로드/디바이스 이동 ===
+# === Model generation/load/moving device ===
 aff_model = EnhancedAffinity(
     lig_dim=1039,           # 15D + ECFP1024
     cav_dim=35, hid=128, heads=4, dropout=0.1,
@@ -190,20 +189,20 @@ aff_model = EnhancedAffinity(
 aff_model.load_state_dict(ck["state_dict"], strict=True)
 aff_model.to(device).eval()
 
-# (안전망) 버퍼들도 디바이스 고정
+# fix buffer device
 for name, buf in aff_model.named_buffers():
     setattr(aff_model, name, buf.to(device))
 
-# === 2) 입력 텐서 디바이스 이동 ===
+# === moving input tensor device ===
 assert X_L.shape[1] in (1039, 2063), f"lig_dim mismatch: got {X_L.shape[1]}"
 X_L = X_L.to(device)                   # [N, 1039] (또는 2063)
 C_raw_target = C_raw_target.to(device) # [T, 35]
 T = C_raw_target.size(0)
 
-# 이름 길이 체크
+# name length checking
 assert len(ligand_names) == X_L.size(0), "names length != X_L N"
 
-# === 3) 배치 추론 ===
+# === inference batch ===
 batch_size = 512
 preds = []
 
@@ -211,34 +210,32 @@ with torch.no_grad():
     for s in range(0, X_L.size(0), batch_size):
         e = min(s + batch_size, X_L.size(0))
         Lb = X_L[s:e]  # [B, 1039]
-        # C는 모든 배치 공통이므로 repeat
         Cb = C_raw_target.unsqueeze(0).repeat(e - s, 1, 1)  # [B, T, 35]
         lengths = torch.full((e - s,), T, device=device, dtype=torch.long)
 
-        y_hat = aff_model(Lb, Cb, lengths)      # 정규화 공간
-        y_pred = y_hat * y_std + y_mean         # 복원
-        preds.append(y_pred.detach().cpu())     # CPU로 모으기
-
-# 리스트[Tensors] -> 하나의 1D 텐서
+        y_hat = aff_model(Lb, Cb, lengths)     
+        y_pred = y_hat * y_std + y_mean        
+        preds.append(y_pred.detach().cpu())   
+        
 preds_t = torch.cat(preds, dim=0)   # [N] (CPU)
 print("preds_t shape:", preds_t.shape)
 
-# === 4) CSV 저장 (원본 순서 & 정렬본 둘 다) ===
+# === Save result to CSV ===
 df = pd.DataFrame({
     "Ligand": ligand_names,
     "Predicted_affinity": preds_t.numpy()
 })
 out_csv = "/home/yejin/affinity/drugbank_predictions.csv"
 df.to_csv(out_csv, index=False)
-print(f"✅ 저장 완료: {out_csv}")
+print(f"Compelte save: {out_csv}")
 
 # 정렬본
 df_sorted = df.sort_values("Predicted_affinity", ascending=False).reset_index(drop=True)
 out_csv_sorted = "/home/yejin/affinity/drugbank_predictions_sorted.csv"
 df_sorted.to_csv(out_csv_sorted, index=False)
-print(f"✅ 정렬 저장 완료: {out_csv_sorted}")
+print(f"Compelte save sorted: {out_csv_sorted}")
 
-# === 5) Top-K 출력 (토치 정렬 사용) ===
+# === Printing Top-K ===
 topk = 50
 order = torch.argsort(preds_t, descending=True)
 print("\nTop-{} predictions:".format(topk))
@@ -249,13 +246,13 @@ class AttnBindV2(nn.Module):
     def __init__(self, enhanced_seed, tau=0.5):
         super().__init__()
         import copy
-        # 통계
+
         self.register_buffer("mu_L15",   enhanced_seed.mu_L15.clone())
         self.register_buffer("sigma_L15",enhanced_seed.sigma_L15.clone())
         self.register_buffer("mu_C",     enhanced_seed.mu_C.clone())
         self.register_buffer("sigma_C",  enhanced_seed.sigma_C.clone())
 
-        # 리간드 타워 / 캐비티 타워 복제
+
         self.lig15   = copy.deepcopy(enhanced_seed.lig15)
         self.ligfp   = copy.deepcopy(enhanced_seed.ligfp)
         self.lig_fuse= copy.deepcopy(enhanced_seed.lig_fuse)
@@ -263,7 +260,7 @@ class AttnBindV2(nn.Module):
         self.self_attn = copy.deepcopy(enhanced_seed.self_attn)
         self.cav_ff    = copy.deepcopy(enhanced_seed.cav_ff)
 
-        # WD 파라미터 복제
+
         self.U = nn.Parameter(enhanced_seed.U.detach().clone())
         self.V = nn.Parameter(enhanced_seed.V.detach().clone())
         self.a = nn.Parameter(enhanced_seed.a.detach().clone())
@@ -273,7 +270,7 @@ class AttnBindV2(nn.Module):
         hid = self.U.size(0)
         self.tau = tau
 
-        # 분류 헤드/델타
+
         self.head = nn.Sequential(
             nn.Linear(2*hid, 128), nn.ReLU(), nn.Dropout(0.2),
             nn.Linear(128, 1)
@@ -285,7 +282,7 @@ class AttnBindV2(nn.Module):
     def forward(self, L_raw, C_raw, lengths, return_alpha=False):
         B, T, D = C_raw.shape  # D=35
 
-        # ---- ligand (15D z-score + ECFP 그대로) ----
+        # ---- ligand (15D z-score + ECFP) ----
         L15 = L_raw[:, :15]
         Lfp = L_raw[:, 15:]
         L15z = (L15 - self.mu_L15) / self.sigma_L15

@@ -109,11 +109,11 @@ def charge_at_pH7(aa, pH=7.0):
     if aa not in SIDECHAIN_PKA:
         return 0.0
     pKa = SIDECHAIN_PKA[aa]
-    if aa in {'D','E','C','Y'}:  # 산성
-        frac_deprot = 1.0 / (1.0 + 10**(pKa - pH))  # 음전하 비율
+    if aa in {'D','E','C','Y'}:  # acid
+        frac_deprot = 1.0 / (1.0 + 10**(pKa - pH))  # ratio of negative charge
         return -frac_deprot
-    elif aa in {'K','R','H'}:    # 염기성
-        frac_prot   = 1.0 / (1.0 + 10**(pH - pKa))  # 양전하 비율
+    elif aa in {'K','R','H'}:    # base
+        frac_prot   = 1.0 / (1.0 + 10**(pH - pKa))  # ratio of positive charge
         return +frac_prot
     return 0.0
 
@@ -164,12 +164,12 @@ def bfactor_mean(residue):
 # using the Shrake–Rupley algorithm implemented in Biopython
 def sasa_residue_map_biopython(structure):
     from Bio.PDB.SASA import ShrakeRupley
-    sr = ShrakeRupley()                  # 기본: probe_radius=1.4Å, n_points=100
-    sr.compute(structure, level='R')     # residue 레벨로 계산하여 res.xtra['EXP_ACC'] 채움
+    sr = ShrakeRupley()                  # basic setting: probe_radius=1.4Å, n_points=100
+    sr.compute(structure, level='R')     # residue level calculate res.xtra['EXP_ACC']
     sasa_map = {}
     for ch in structure[0]:
         for res in ch:
-            if res.get_id()[0] != ' ':   # HETATM 제외
+            if res.get_id()[0] != ' ':   # exception of HETATM
                 continue
             key = (ch.id, res.get_id())  # (chain_id, (' ', seqnum, icode))
             sasa_map[key] = float(res.xtra.get('EXP_ACC', 0.0))

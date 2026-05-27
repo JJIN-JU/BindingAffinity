@@ -229,7 +229,7 @@ out_csv = "/home/yejin/affinity/drugbank_predictions.csv"
 df.to_csv(out_csv, index=False)
 print(f"Compelte save: {out_csv}")
 
-# 정렬본
+# Sorting
 df_sorted = df.sort_values("Predicted_affinity", ascending=False).reset_index(drop=True)
 out_csv_sorted = "/home/yejin/affinity/drugbank_predictions_sorted.csv"
 df_sorted.to_csv(out_csv_sorted, index=False)

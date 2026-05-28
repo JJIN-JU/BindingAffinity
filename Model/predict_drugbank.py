@@ -4,7 +4,7 @@ from model import EnhancedAffinity, AttnBindV2
 @torch.no_grad()
 def compute_wd_scores(model, Lb, Cb, lengths=None):
     """
-    Calculate Weighted-Dot 원시 점수(S_raw)
+    Calculate Weighted-Dot (S_raw)
     return: S_raw [B] (scalar per ligands)
     module: model.mu_L15, model.sigma_L15, model.mu_C, model.sigma_C,
                    model.lig15, model.ligfp, model.lig_fuse,

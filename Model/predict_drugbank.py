@@ -27,7 +27,7 @@ def compute_wd_scores(model, Lb, Cb, lengths=None):
     Ch0  = model.cav_proj(Cz.reshape(-1, D)).view(B, T, -1)     # [B,T,h]
 
     if lengths is None:
-        kpm = torch.zeros((B, T), dtype=torch.bool, device=device)   # pad 없음
+        kpm = torch.zeros((B, T), dtype=torch.bool, device=device)   
     else:
         idx = torch.arange(T, device=device).unsqueeze(0).expand(B, T)
         kpm = ~(idx < lengths.unsqueeze(1))  # True = pad

@@ -4,9 +4,9 @@ from model import EnhancedAffinity, AttnBindV2
 @torch.no_grad()
 def compute_wd_scores(model, Lb, Cb, lengths=None):
     """
-    모델 내부 모듈을 그대로 사용해 논문식 Weighted-Dot 원시 점수(S_raw)를 계산.
-    return: S_raw [B] (리간드당 스칼라)
-    필요 모듈/통계: model.mu_L15, model.sigma_L15, model.mu_C, model.sigma_C,
+    Calculate Weighted-Dot 원시 점수(S_raw)
+    return: S_raw [B] (scalar per ligands)
+    module: model.mu_L15, model.sigma_L15, model.mu_C, model.sigma_C,
                    model.lig15, model.ligfp, model.lig_fuse,
                    model.cav_proj, model.self_attn, model.cav_ff, model.U, model.V
     """
@@ -14,14 +14,14 @@ def compute_wd_scores(model, Lb, Cb, lengths=None):
     Lb = Lb.to(device); Cb = Cb.to(device)
     if lengths is not None: lengths = lengths.to(device)
 
-    # --- ligand 임베딩 ---
-    L15, Lfp = Lb[:, :15], Lb[:, 15:]                      # [B,15], [B,1024] 등
+    # --- ligand embedding ---
+    L15, Lfp = Lb[:, :15], Lb[:, 15:]                      # [B,15], [B,1024] etc.
     L15z = (L15 - model.mu_L15) / model.sigma_L15
     L15h = model.lig15(L15z)                                # [B,h]
     Lfph = model.ligfp(Lfp)                                 # [B,h]
     Lh   = model.lig_fuse(torch.cat([L15h, Lfph], dim=1))   # [B,h]
 
-    # --- cavity 컨텍스트 ---
+    # --- cavity context ---
     B, T, D = Cb.shape
     Cz   = (Cb - model.mu_C) / model.sigma_C
     Ch0  = model.cav_proj(Cz.reshape(-1, D)).view(B, T, -1)     # [B,T,h]
@@ -36,7 +36,7 @@ def compute_wd_scores(model, Lb, Cb, lengths=None):
     Ch_ctx = Ch0 + Ch_ctx
     Ch_ctx = Ch_ctx + model.cav_ff(Ch_ctx)                     # [B,T,h]
 
-    # --- Weighted Dot (논문식) ---
+    # --- Weighted Dot ---
     W  = model.U @ model.V.t()                                 # [h,h]
     LW = torch.matmul(Lh, W)                                    # [B,h]
     s_core = torch.einsum('bh,bth->bt', LW, Ch_ctx)             # [B,T]
@@ -45,7 +45,7 @@ def compute_wd_scores(model, Lb, Cb, lengths=None):
     denom = valid.float().sum(1).clamp_min(1)
     S_raw = (s_core.masked_fill(~valid, 0.0).sum(1) / denom)    # [B]
     return S_raw
-# --- EnhancedAffinity 체크포인트 로드 ---
+# --- EnhancedAffinity checkpoint load ---
 ck = torch.load("enhanced_affinity_cosine_warmup_best2.pt", map_location="cpu")
 y_mean, y_std     = ck["y_mean"], ck["y_std"]
 mu_L15, sigma_L15 = ck["mu_L15"], ck["sigma_L15"]
@@ -60,8 +60,7 @@ enh = EnhancedAffinity(
 ).to(device)
 enh.load_state_dict(ck["state_dict"], strict=True)
 
-# --- 분류 모델 정의 & 로드 ---
-# --- 기존 그대로 ---
+# --- model ---
 clf = AttnBindV2(enh).to(device)
 ckb = torch.load("attnbind_bin_best.pt", map_location="cpu")
 clf.load_state_dict(ckb["state_dict"])
@@ -71,7 +70,6 @@ from joblib import load as joblib_load
 platt = joblib_load("cal_platt.joblib")
 iso   = joblib_load("cal_isotonic.joblib")
 
-# --- 추론 ---
 logits_list = []
 wd_list     = []      # (NEW)
 bs = 512
@@ -83,40 +81,39 @@ with torch.no_grad():
         Cb = C_raw_target.unsqueeze(0).repeat(e-s,1,1).to(device) # [B,T,35]
         lengths = torch.full((e-s,), T, device=device, dtype=torch.long)
 
-        # 기존 로짓
         logit = clf(Lb, Cb, lengths)              # [B]
         logits_list.append(logit.detach().cpu())
 
-        # (NEW) WD 원시 점수
+        # WD raw score
         S_raw = compute_wd_scores(clf, Lb, Cb, lengths)  # [B]
         wd_list.append(S_raw.detach().cpu())
 
-# numpy 변환
+# numpy
 import numpy as np, pandas as pd, torch
 logits = torch.cat(logits_list).numpy().reshape(-1)
 wd_raw = torch.cat(wd_list).numpy().reshape(-1)
 
-# 기존 보정 확률
+# Existing corrected probability
 p_raw   = 1.0/(1.0 + np.exp(-logits))
 p_platt = platt.predict_proba(logits.reshape(-1,1))[:,1]
 p_iso   = iso.predict(p_raw)
 p_final = p_platt
 
-# (NEW) 논문식: WD → min–max → cutoff/랭킹
+# WD → min–max → cutoff/rank
 wd_min, wd_max = wd_raw.min(), wd_raw.max()
 wd_norm = (wd_raw - wd_min) / (wd_max - wd_min + 1e-8)
 wd_label = (wd_norm >= 0.5).astype(int)
 
-# (옵션) 논문 스킨 범위로 매핑
+# (option) mapping
 CENTER, WIDTH = 0.5033, 0.0068
 wd_mapped = CENTER + (WIDTH/2) - wd_norm * WIDTH
 
-# 저장
+# save
 df_prob = pd.DataFrame({
     "Ligand": ligand_names,
     "P_raw": p_raw, "P_platt": p_platt, "P_iso": p_iso, "P_final": p_final
 })
-df_prob.to_csv("/home/yejin/affinity/drugbank_classification_probs_calibrated.csv", index=False)
+df_prob.to_csv("/your path", index=False)
 
 df_wd = pd.DataFrame({
     "Ligand": ligand_names,
@@ -142,29 +139,29 @@ FEATURE_KEYS = [
 def heatmap_residue_by_ligfeat_multiC(
     X_L, C_raw_target, i,
     mu_L15, sigma_L15,
-    cavity_feat_idx_map,              # 예: {"HBD_pot":0,"HBA_pot":1,"Hydrophobicity":2,"Charge":3,...}
-    cavity_axes=None,                 # None이면 map 전부 사용, 아니면 ["Hydrophobicity","Charge",...]
-    weights=None,                     # 축별 가중치 리스트(길이 = len(cavity_axes)); None이면 동일가중
-    cav_norm="z",                     # "z" | "minmax" | None  (축별 정규화 방식)
+    cavity_feat_idx_map,              # e.g. {"HBD_pot":0,"HBA_pot":1,"Hydrophobicity":2,"Charge":3,...}
+    cavity_axes=None,                 # If none = use all map / If not none = ["Hydrophobicity","Charge",...]
+    weights=None,                     # Axis-wise weight list (length = len(cavity_axes)); if None, equal weights are applied
+    cav_norm="z",                     # "z" | "minmax" | None  (axis-wise normalization method)
     out_png="residue_x_ligfeat_multiC.png",
     out_csv="residue_x_ligfeat_multiC.csv",
     ligand_name="ligand",
-    residue_numbers=None              # 예: [831,832,...]  (y축 라벨용)
+    residue_numbers=None              
 ):
-    # CPU로 통일
+    # CPU
     X = X_L.detach().cpu().float()
     C = C_raw_target.detach().cpu().float()
     T = C.size(0)
 
-    # 사용할 cavity 축들
+    # usiing cavity axes
     if cavity_axes is None:
         cavity_axes = list(cavity_feat_idx_map.keys())
     idxs = [cavity_feat_idx_map[n] for n in cavity_axes]
 
-    # 선택 축 행렬 [T, K]
+    # selected axis matrix [T, K]
     C_sel = torch.stack([C[:, j] for j in idxs], dim=1)  # [T, K]
 
-    # 축별 정규화
+    # axis-wise normalization
     if cav_norm == "z":
         mu = C_sel.mean(dim=0, keepdim=True)
         sd = C_sel.std(dim=0, keepdim=True) + 1e-8
@@ -176,25 +173,25 @@ def heatmap_residue_by_ligfeat_multiC(
     else:
         Cn = C_sel
 
-    # 가중치
+    # weight
     K = Cn.size(1)
     if weights is None:
         w = torch.ones(K) / K
     else:
         w = torch.as_tensor(weights, dtype=torch.float32)
         w = w / (w.sum() + 1e-8)
-    # residue별 합성 스칼라 v_comb[r]
+    # residue-wise composite scalar v_comb[r]
     v_comb = (Cn * w) .sum(dim=1)   # [T]
 
-    # 리간드 15D z-score
+    # ligands 15D z-score
     mu15 = torch.as_tensor(mu_L15[:15]).float()
     sg15 = torch.as_tensor(sigma_L15[:15]).float()
     lig15_z = (X[i, :15] - mu15) / (sg15 + 1e-8)        # [15]
 
-    # 히트맵 행렬
+    # heatmap
     M = torch.outer(v_comb, lig15_z).numpy()            # [T, 15]
 
-    # CSV 저장
+    # save CSV
     df = pd.DataFrame(M, columns=FEATURE_KEYS)
     if residue_numbers is not None:
         df.insert(0, "residue", [f"Res{n}" for n in residue_numbers])
@@ -203,7 +200,6 @@ def heatmap_residue_by_ligfeat_multiC(
     Path(out_csv).parent.mkdir(parents=True, exist_ok=True)
     df.to_csv(out_csv, index=False, encoding="utf-8-sig")
 
-    # 그림
     H, W = M.shape
     vmin, vmax = np.nanmin(M), np.nanmax(M)
     mid = (vmin + vmax) / 2.0
@@ -212,20 +208,20 @@ def heatmap_residue_by_ligfeat_multiC(
     im = ax.imshow(M, aspect='auto', vmin=vmin, vmax=vmax, cmap="viridis")
     cbar = plt.colorbar(im, ax=ax, label="Interaction score")
 
-    # tick 라벨
+    # tick label
     ax.set_xticks(range(W)); ax.set_xticklabels(FEATURE_KEYS, rotation=45, ha='right')
     if residue_numbers is not None:
         ax.set_yticks(range(T)); ax.set_yticklabels([f"Res{n}" for n in residue_numbers])
     else:
         ax.set_yticks(range(T)); ax.set_yticklabels(range(T))
 
-    # --- grid (경계선) ---
+    # --- grid ---
     ax.set_xticks(np.arange(-.5, W, 1), minor=True)
     ax.set_yticks(np.arange(-.5, H, 1), minor=True)
     ax.grid(which="minor", color="white", linestyle="-", linewidth=0.8, alpha=0.9)
     ax.tick_params(which="minor", bottom=False, left=False)
 
-    # --- 각 셀에 숫자 표시 ---
+    # --- mark num each cell ---
     for r in range(H):
         for c in range(W):
             val = M[r, c]
@@ -242,16 +238,17 @@ def heatmap_residue_by_ligfeat_multiC(
     plt.close()
 
     return out_png, out_csv
-# 35D(raw) -> 8D(summary) 변환
+
+# 35D(raw) -> 8D(summary)
 import torch
 
 AA_CODES = ['A','R','N','D','C','Q','E','G','H','I','L','K','M','F','P','S','T','W','Y','V']
 
-_DONOR_W = torch.tensor([  # HBD 잠재력(잔기 가중치)
+_DONOR_W = torch.tensor([  # HBD
     0,1,1,0,1,1,0,0,1,0,0,1,0,0,0,1,1,1,1,0
 ], dtype=torch.float32)
 
-_ACCEPT_W = torch.tensor([  # HBA 잠재력(잔기 가중치)
+_ACCEPT_W = torch.tensor([  # HBA 
     0,0,1,1,1,1,1,0,1,0,0,0,0,0,0,1,1,0,1,0
 ], dtype=torch.float32)
 
@@ -322,12 +319,12 @@ def _lig15_z(X_L, i, mu_L15, sigma_L15):
     return ((X_L[i,:15].detach().cpu().float() - mu15) / (sg15 + 1e-8)).numpy()
 
 def heatmap_single_with_reslabels(
-        C_axes,                       # [T, K] = build_cavity_summary_axes 결과 (요약 8축)
+        C_axes,                       # [T, K] = build_cavity_summary_axes results
         cav_idx,                      # dict: {"HBD":0,"HBA":1,...}
-        X_L, ligand_names, i,         # 리간드 선택 인덱스
+        X_L, ligand_names, i,         
         mu_L15, sigma_L15,
-        residue_numbers=None,         # [831,832,833,834] 같은 번호
-        residue_names=None,           # ["Lys","Asp","Gly","Tyr"] 같은 이름(옵션)
+        residue_numbers=None,         # [831,832,833,834]
+        residue_names=None,           # ["Lys","Asp","Gly","Tyr"]
         cavity_axes=("HBD","HBA","Hydrophobicity","Charge","Aromatic","Flexibility","SASA/RSA","Distance"),
         cav_norm="z",
         out_png="residue_x_ligfeat_single.png",
@@ -335,7 +332,7 @@ def heatmap_single_with_reslabels(
         annotate=True,
         vmin=-0.5, vmax=0.5
     ):
-    # cavity 합성 스칼라 (선택 축 평균; 축별 정규화 옵션)
+    # cavity
     idxs = [cav_idx[a] for a in cavity_axes]
     C_sel = torch.stack([C_axes[:,j] for j in idxs], dim=1).cpu().float()  # [T,K]
     if cav_norm == "z":
@@ -348,11 +345,11 @@ def heatmap_single_with_reslabels(
         Cn = C_sel
     v_comb = Cn.mean(dim=1).numpy()  # [T]
 
-    # 리간드 15D z-score
+    # ligands 15D z-score
     lig15 = _lig15_z(X_L, i, mu_L15, sigma_L15)  # [15]
     M = np.outer(v_comb, lig15)                  # [T,15]
 
-    # 라벨 구성
+    # label
     if residue_names is not None and residue_numbers is not None:
         ylabels = [f"{residue_names[k]}{residue_numbers[k]}" for k in range(len(residue_numbers))]
     elif residue_numbers is not None:
@@ -360,13 +357,12 @@ def heatmap_single_with_reslabels(
     else:
         ylabels = [f"Res{i}" for i in range(M.shape[0])]
 
-    # 저장(CSV)
+    # save CSV
     df = pd.DataFrame(M, columns=FEATURE_KEYS)
     df.insert(0, "residue", ylabels)
     Path(out_csv).parent.mkdir(parents=True, exist_ok=True)
     df.to_csv(out_csv, index=False, encoding="utf-8-sig")
 
-    # 그림
     H,W = M.shape
     if vmin is None: vmin = np.nanmin(M)
     if vmax is None: vmax = np.nanmax(M)
@@ -378,7 +374,7 @@ def heatmap_single_with_reslabels(
     ax.set_xticks(range(W)); ax.set_xticklabels(FEATURE_KEYS, rotation=45, ha='right')
     ax.set_yticks(range(H)); ax.set_yticklabels(ylabels)
 
-    # grid + 숫자
+    # grid + num
     ax.set_xticks(np.arange(-.5, W, 1), minor=True)
     ax.set_yticks(np.arange(-.5, H, 1), minor=True)
     ax.grid(which="minor", color="white", linestyle="-", linewidth=0.8, alpha=0.9)
@@ -397,12 +393,12 @@ def heatmap_single_with_reslabels(
     plt.tight_layout(); plt.savefig(out_png, dpi=300); plt.close()
     return out_png, out_csv
       
-# A) 단일 히트맵 (잔기 이름까지)
+# heatmap
 png_single, csv_single = heatmap_single_with_reslabels(
     C_axes, cav_idx, X_L, ligand_names,
     i = next(i for i,s in enumerate(ligand_names) if "Remdesivir".lower() in str(s).lower()),
     mu_L15=mu_L15, sigma_L15=sigma_L15,
-    residue_numbers=[831,832,833,834],
-    residue_names=["Gly","Asp","Asn","Glu"],   # 실제 이름에 맞게 넣으세요
-    out_png="/home/yejin/affinity/imap_Ramdesivir_labeled.png",
-    out_csv="/home/yejin/affinity/imap_Ramdesivir_labeled.csv"
+    residue_numbers=[831,832,833,834],         # e.g.
+    residue_names=["Gly","Asp","Asn","Glu"],   # e.g.
+    out_png="/your/path.png",
+    out_csv="/your/path.csv"

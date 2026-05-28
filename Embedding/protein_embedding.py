@@ -312,7 +312,7 @@ def save_cavity_cache(pdb_id, chain_id, residue_numbers, C, residues, cavity_cen
         "saved_at": datetime.utcnow().isoformat() + "Z",
         "cavity_center": cavity_center.astype(float),  
         "residues": res_meta,
-        "C": C.cpu(),  # GPU 텐서일 수 있으니 CPU로 저장
+        "C": C.cpu(),  
     }
 
     torch.save(payload, tmp_path)
